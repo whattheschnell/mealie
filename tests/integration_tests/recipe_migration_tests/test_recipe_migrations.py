@@ -1,5 +1,8 @@
+import json
 import os
 from dataclasses import dataclass, field
+from gzip import GzipFile
+from io import BytesIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile
@@ -95,6 +98,15 @@ test_cases = [
         },
     ),
     MigrationTestData(
+        typ=SupportedMigrations.plantoeat,
+        archive=test_data.migrations_plantoeat_csv,
+        search_slug="test-recipe",
+        nutrition_filter={
+            "unsaturatedFatContent",
+            "transFatContent",
+        },
+    ),
+    MigrationTestData(
         typ=SupportedMigrations.myrecipebox,
         archive=test_data.migrations_myrecipebox,
         search_slug="beef-cheese-piroshki",
@@ -124,6 +136,7 @@ test_ids = [
     "mealie_alpha_archive",
     "tandoor_archive",
     "plantoeat_archive",
+    "plantoeat_csv",
     "myrecipebox_csv",
     "recipekeeper_archive",
     "cookn_archive",
@@ -190,6 +203,30 @@ def test_recipe_migration(api_client: TestClient, unique_user_fn_scoped: TestUse
     # TODO: validate other types of content
 
 
+def test_plantoeat_rejects_invalid_file_type(api_client: TestClient, unique_user: TestUser) -> None:
+    # Simulate uploading a binary file (e.g. PDF) that is neither ZIP nor CSV/TXT
+    binary_content = bytes(range(256)) * 4  # arbitrary binary data that is not valid UTF-8
+    payload = {"migration_type": SupportedMigrations.plantoeat.value}
+    file_payload = {"archive": binary_content}
+
+    response = api_client.post(
+        api_routes.groups_migrations,
+        data=payload,
+        files=file_payload,
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    report_id = response.json()["id"]
+
+    response = api_client.get(api_routes.groups_reports_item_id(report_id), headers=unique_user.token)
+    assert response.status_code == 200
+    report = response.json()
+    assert report["entries"]
+    assert not report["entries"][0]["success"]
+    assert "ZIP" in report["entries"][0]["message"] or "CSV" in report["entries"][0]["message"]
+
+
 def test_bad_mealie_alpha_data_is_ignored(api_client: TestClient, unique_user: TestUser):
     with TemporaryDirectory() as tmpdir:
         with ZipFile(test_data.migrations_mealie) as zf:
@@ -251,3 +288,65 @@ def test_bad_mealie_alpha_data_is_ignored(api_client: TestClient, unique_user: T
     report_entry = ReportEntryOut.model_validate(failed_item)
     assert report_entry.message == "Failed to import invalid-recipe.json"
     assert report_entry.exception == "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"
+
+
+def test_recipekeeper_imports_categories_and_yield(api_client: TestClient, unique_user_fn_scoped: TestUser) -> None:
+    """Recipe Keeper categories and yields were dropped by the migrator's snake_case alias keys."""
+    unique_user = unique_user_fn_scoped
+
+    response = api_client.post(
+        api_routes.groups_migrations,
+        data={"migration_type": SupportedMigrations.recipekeeper.value},
+        files={"archive": test_data.migrations_recipekeeper.read_bytes()},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+
+    def get(slug: str) -> Recipe:
+        return Recipe(**assert_deserialize(api_client.get(api_routes.recipes_slug(slug), headers=unique_user.token)))
+
+    # a bare number in recipeYield is a yield quantity
+    recipe = get("zucchini-bread")
+    assert [c.name for c in recipe.recipe_category or []] == ["Bread"]
+    assert recipe.recipe_yield_quantity == 16
+
+    # a number with a unit is a serving count
+    recipe = get("baked-salmon-fillets-dijon")
+    assert [c.name for c in recipe.recipe_category or []] == ["Fish"]
+    assert recipe.recipe_servings == 4
+
+
+def test_paprika_imports_notes(api_client: TestClient, unique_user_fn_scoped: TestUser) -> None:
+    """Paprika exports carry recipe notes in a `notes` string, which must survive the import."""
+    unique_user = unique_user_fn_scoped
+    note_text = "Burnt brandy is brandy that has been flamed to burn off the alcohol."
+
+    recipe_json = json.dumps(
+        {
+            "name": "Paprika Notes Test",
+            "ingredients": "1 cup flour\n2 eggs",
+            "directions": "Mix everything together.",
+            "notes": note_text,
+        }
+    ).encode()
+
+    archive = BytesIO()
+    with ZipFile(archive, "w") as zip_file:
+        gzipped = BytesIO()
+        with GzipFile(fileobj=gzipped, mode="wb") as gz:
+            gz.write(recipe_json)
+        zip_file.writestr("paprika-notes-test.paprikarecipe", gzipped.getvalue())
+
+    response = api_client.post(
+        api_routes.groups_migrations,
+        data={"migration_type": SupportedMigrations.paprika.value},
+        files={"archive": archive.getvalue()},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+
+    response = api_client.get(api_routes.recipes_slug("paprika-notes-test"), headers=unique_user.token)
+    recipe = Recipe(**assert_deserialize(response))
+
+    assert recipe.notes
+    assert recipe.notes[0].text == note_text

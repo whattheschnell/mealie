@@ -3,7 +3,7 @@ repos:
     rev: v6.0.0
     hooks:
       - id: check-yaml
-        exclude: "mkdocs.yml"
+        exclude: (mkdocs.yml|pnpm-lock.yaml)
       - id: check-json
         exclude: (.vscode|.devcontainer)
       - id: check-toml
@@ -12,7 +12,10 @@ repos:
         exclude: ^tests/data/
   - repo: https://github.com/astral-sh/ruff-pre-commit
     # Ruff version.
-    rev: v0.14.14
+    rev: v0.16.0
     hooks:
-      - id: ruff
+        # Linter
+      - id: ruff-check
+        args: [ --fix ]
+        # Formatter
       - id: ruff-format

@@ -1,4 +1,4 @@
-from sqlite3 import IntegrityError
+from sqlalchemy.exc import IntegrityError
 
 from mealie.lang.providers import Translator
 
@@ -38,9 +38,42 @@ class SlugError(Exception):
     pass
 
 
+class MissingRequiredData(Exception):
+    """
+    This exception is raised when a full-replacement update is missing data that the
+    resource cannot exist without.
+    """
+
+    pass
+
+
 class NoEntryFound(Exception):
     """
     This exception is raised when a user tries to access a resource that does not exist.
+    """
+
+    pass
+
+
+class OpenAIServiceError(Exception):
+    """
+    This exception is raised when there is an error communicating with OpenAI services.
+    """
+
+    pass
+
+
+class RateLimitError(Exception):
+    """
+    This exception is raised when an external API returns a rate limit (429) error.
+    """
+
+    pass
+
+
+class VideoDownloadError(Exception):
+    """
+    This exception is raised when there is an error downloading or processing a video.
     """
 
     pass

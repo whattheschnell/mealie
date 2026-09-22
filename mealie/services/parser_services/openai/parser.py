@@ -1,4 +1,3 @@
-import asyncio
 import json
 
 from rapidfuzz import fuzz
@@ -10,6 +9,7 @@ from mealie.schema.recipe.recipe_ingredient import (
     IngredientConfidence,
     ParsedIngredient,
     RecipeIngredient,
+    RecipeIngredientSubstitution,
 )
 from mealie.services.openai import OpenAIDataInjection, OpenAIService
 
@@ -89,13 +89,44 @@ class OpenAIParser(ABCIngredientParser):
             comment=note_conf,
         )
 
+    def _convert_substitutes(
+        self, substitutes: list[str], food: CreateIngredientFood | None
+    ) -> list[RecipeIngredientSubstitution]:
+        """
+        Resolves each alternative the model extracted to an existing food, keeping the raw text
+        as a note when nothing matches.
+
+        Unlike the ingredient's own food, a substitute cannot be invented here: the column holds
+        a food id, and an id for a food that does not exist yet is dropped on save. The note
+        fallback is what keeps the alternative from being lost either way.
+        """
+
+        ingredient_food = self.data_matcher.find_food_match(food) if food else None
+
+        substitutions: list[RecipeIngredientSubstitution] = []
+        for substitute in substitutes:
+            substitute = substitute.strip()
+            if not substitute:
+                continue
+
+            food_match = self.data_matcher.find_food_match(substitute)
+            if not food_match:
+                substitutions.append(RecipeIngredientSubstitution(note=substitute))
+            elif not ingredient_food or food_match.id != ingredient_food.id:
+                # an alternative that resolves back to the ingredient's own food says nothing
+                substitutions.append(RecipeIngredientSubstitution(substitute_food_id=food_match.id))
+
+        return substitutions
+
     def _convert_ingredient(self, original_text: str, openai_ing: OpenAIIngredient) -> ParsedIngredient:
+        food = CreateIngredientFood(name=openai_ing.food) if openai_ing.food else None
         ingredient = RecipeIngredient(
             original_text=original_text,
             quantity=openai_ing.quantity,
             unit=CreateIngredientUnit(name=openai_ing.unit) if openai_ing.unit else None,
-            food=CreateIngredientFood(name=openai_ing.food) if openai_ing.food else None,
+            food=food,
             note=openai_ing.note,
+            substitutions=self._convert_substitutes(openai_ing.substitutes, food),
         )
 
         parsed_ingredient = ParsedIngredient(
@@ -107,7 +138,7 @@ class OpenAIParser(ABCIngredientParser):
         return self.find_ingredient_match(parsed_ingredient)
 
     def _get_prompt(self, service: OpenAIService) -> str:
-        if service.send_db_data and self.data_matcher.units_by_alias:
+        if self.data_matcher.units_by_alias:
             data_injections = [
                 OpenAIDataInjection(
                     description=(
@@ -125,36 +156,18 @@ class OpenAIParser(ABCIngredientParser):
 
         return service.get_prompt("recipes.parse-recipe-ingredients", data_injections=data_injections)
 
-    @staticmethod
-    def _chunk_messages(messages: list[str], n=1) -> list[list[str]]:
-        if n < 1:
-            n = 1
-        return [messages[i : i + n] for i in range(0, len(messages), n)]
-
     async def _parse(self, ingredients: list[str]) -> OpenAIIngredients:
-        service = OpenAIService()
+        service = OpenAIService(self.repos)
         prompt = self._get_prompt(service)
 
-        # chunk ingredients and send each chunk to its own worker
-        ingredient_chunks = self._chunk_messages(ingredients, n=service.workers)
-        tasks = [
-            service.get_response(prompt, json.dumps(chunk, separators=(",", ":")), response_schema=OpenAIIngredients)
-            for chunk in ingredient_chunks
-        ]
+        response = await service.get_response(
+            prompt, json.dumps(ingredients, separators=(",", ":")), response_schema=OpenAIIngredients
+        )
 
-        # re-combine chunks into one response
-        try:
-            unfiltered_responses = await asyncio.gather(*tasks)
-        except Exception as e:
-            raise Exception("Failed to call OpenAI services") from e
-
-        responses = [response for response in unfiltered_responses if response]
-        if not responses:
+        if not response:
             raise Exception("No response from OpenAI")
 
-        return OpenAIIngredients(
-            ingredients=[ingredient for response in responses for ingredient in response.ingredients]
-        )
+        return OpenAIIngredients(ingredients=response.ingredients)
 
     async def parse_one(self, ingredient_string: str) -> ParsedIngredient:
         items = await self.parse([ingredient_string])

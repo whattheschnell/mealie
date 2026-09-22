@@ -21,7 +21,7 @@ jobs:
           private-key: ${{ secrets.COMMIT_BOT_APP_PRIVATE_KEY }}
 
       - name: Checkout 🛎
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
 
@@ -37,7 +37,7 @@ jobs:
         run: |
           sed -i 's/^version = "[^"]*"/version = "${{ env.VERSION_NUM }}"/' pyproject.toml
           sed -i '/^name = "mealie"$/,/^version = / s/^version = "[^"]*"/version = "${{ env.VERSION_NUM }}"/' uv.lock
-          sed -i 's/\("version": "\)[^"]*"/\1${{ env.VERSION_NUM }}"/' frontend/package.json
+          sed -i '0,/"version": "/{s/\("version": "\)[^"]*"/\1${{ env.VERSION_NUM }}"/}' frontend/package.json
           sed -i 's/:v[0-9]*\.[0-9]*\.[0-9]*/:v${{ env.VERSION_NUM }}/' docs/docs/documentation/getting-started/installation/installation-checklist.md
           sed -i 's/:v[0-9]*\.[0-9]*\.[0-9]*/:v${{ env.VERSION_NUM }}/' docs/docs/documentation/getting-started/installation/sqlite.md
           sed -i 's/:v[0-9]*\.[0-9]*\.[0-9]*/:v${{ env.VERSION_NUM }}/' docs/docs/documentation/getting-started/installation/postgres.md
@@ -60,12 +60,16 @@ jobs:
     uses: ./.github/workflows/test-backend.yml
     needs:
       - commit-version-bump
+    with:
+      ref: ${{ needs.commit-version-bump.outputs.commit-sha }}
 
   frontend-tests:
     name: "Frontend Tests"
     uses: ./.github/workflows/test-frontend.yml
     needs:
       - commit-version-bump
+    with:
+      ref: ${{ needs.commit-version-bump.outputs.commit-sha }}
 
   build-package:
     name: Build Package
@@ -74,6 +78,7 @@ jobs:
       - commit-version-bump
     with:
       tag: ${{ github.event.release.tag_name }}
+      ref: ${{ needs.commit-version-bump.outputs.commit-sha }}
 
   publish:
     permissions:
@@ -90,7 +95,9 @@ jobs:
       - backend-tests
       - frontend-tests
       - build-package
+      - commit-version-bump
     with:
+      ref: ${{ needs.commit-version-bump.outputs.commit-sha }}
       tag: ${{ github.event.release.tag_name }}
       tags: |
           hkotel/mealie:latest
@@ -117,7 +124,7 @@ jobs:
           private-key: ${{ secrets.COMMIT_BOT_APP_PRIVATE_KEY }}
 
       - name: Checkout 🛎
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           token: ${{ steps.app-token.outputs.token }}
           fetch-depth: 0

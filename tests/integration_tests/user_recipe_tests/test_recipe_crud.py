@@ -2,7 +2,6 @@ import inspect
 import json
 import os
 import random
-import shutil
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
@@ -14,24 +13,35 @@ from bs4 import BeautifulSoup
 from fastapi.testclient import TestClient
 from httpx import Response
 from pytest import MonkeyPatch
-from recipe_scrapers._abstract import AbstractScraper
 from recipe_scrapers._schemaorg import SchemaOrg
 from recipe_scrapers.plugins import SchemaOrgFillPlugin
 from slugify import slugify
 
+import mealie.services.scraper.recipe_scraper as recipe_scraper_module
+from mealie.db.models.recipe import RecipeModel
 from mealie.pkgs.safehttp.transport import AsyncSafeTransport
 from mealie.schema.cookbook.cookbook import SaveCookBook
+from mealie.schema.labels.multi_purpose_label import MultiPurposeLabelSave
 from mealie.schema.recipe.recipe import Recipe, RecipeCategory, RecipeSummary, RecipeTag
 from mealie.schema.recipe.recipe_category import CategorySave, TagSave
-from mealie.schema.recipe.recipe_ingredient import RecipeIngredient, SaveIngredientFood
+from mealie.schema.recipe.recipe_ingredient import (
+    CreateIngredientFoodAlias,
+    IngredientFood,
+    IngredientUnit,
+    RecipeIngredient,
+    SaveIngredientFood,
+    SaveIngredientUnit,
+)
 from mealie.schema.recipe.recipe_notes import RecipeNote
 from mealie.schema.recipe.recipe_tool import RecipeToolSave
 from mealie.services.recipe.recipe_data_service import RecipeDataService
 from mealie.services.scraper.recipe_scraper import DEFAULT_SCRAPER_STRATEGIES
+from mealie.services.scraper.scraper import ParserErrors
 from tests import utils
 from tests.utils import api_routes
 from tests.utils.factories import random_int, random_string
 from tests.utils.fixture_schemas import TestUser
+from tests.utils.helpers import parse_sse_events
 from tests.utils.recipe_data import get_recipe_test_cases
 
 recipe_test_data = get_recipe_test_cases()
@@ -48,7 +58,7 @@ def zip_recipe(tempdir: str, recipe: RecipeSummary) -> dict:
     json.dump(json.loads(recipe.model_dump_json()), data_file)
     data_file.flush()
 
-    zip_file = shutil.make_archive(os.path.join(tempdir, "zipfile"), "zip")
+    zip_file = os.path.join(tempdir, "zipfile.zip")
     with ZipFile(zip_file, "w") as zf:
         zf.write(data_file.name)
 
@@ -101,12 +111,12 @@ def test_create_by_url(
     monkeypatch: MonkeyPatch,
 ):
     for recipe_data in recipe_test_data:
-        # Override init function for AbstractScraper to use the test html instead of calling the url
-        monkeypatch.setattr(
-            AbstractScraper,
-            "__init__",
-            get_init(recipe_data.html_file),
-        )
+        # Prevent any real HTTP calls during scraping
+        async def mock_safe_scrape_html(url: str) -> str:
+            return "<html></html>"
+
+        monkeypatch.setattr(recipe_scraper_module, "safe_scrape_html", mock_safe_scrape_html)
+
         # Override the get_html method of the RecipeScraperOpenGraph to return the test html
         for scraper_cls in DEFAULT_SCRAPER_STRATEGIES:
             monkeypatch.setattr(
@@ -215,6 +225,172 @@ def test_create_by_html_or_json(
 
     for tag in recipe_dict["tags"]:
         assert tag["name"] in expected_tags
+
+
+def test_create_by_url_stream_done(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: MonkeyPatch,
+):
+    async def mock_safe_scrape_html(url: str) -> str:
+        return "<html></html>"
+
+    monkeypatch.setattr(recipe_scraper_module, "safe_scrape_html", mock_safe_scrape_html)
+
+    recipe_data = recipe_test_data[0]
+    for scraper_cls in DEFAULT_SCRAPER_STRATEGIES:
+        monkeypatch.setattr(
+            scraper_cls,
+            "get_html",
+            open_graph_override(recipe_data.html_file.read_text()),
+        )
+
+    async def return_empty_response(*args, **kwargs):
+        return Response(200, content=b"")
+
+    monkeypatch.setattr(AsyncSafeTransport, "handle_async_request", return_empty_response)
+
+    image_recipe_ids: list[str] = []
+
+    async def scrape_image(self: RecipeDataService, *_):
+        image_recipe_ids.append(str(self.recipe_id))
+        return "TEST_IMAGE"
+
+    monkeypatch.setattr(RecipeDataService, "scrape_image", scrape_image)
+
+    api_client.delete(api_routes.recipes_slug(recipe_data.expected_slug), headers=unique_user.token)
+
+    response = api_client.post(
+        api_routes.recipes_create_url_stream,
+        json={"url": recipe_data.url, "include_tags": False},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+    event_types = [e["event"] for e in events]
+
+    assert "done" in event_types
+    done_event = next(e for e in events if e["event"] == "done")
+    assert done_event["data"]["slug"] == recipe_data.expected_slug
+
+    assert any(e["event"] == "progress" for e in events)
+
+    recipe = api_client.get(api_routes.recipes_slug(recipe_data.expected_slug), headers=unique_user.token).json()
+    assert image_recipe_ids == [recipe["id"]]
+
+
+def test_create_by_url_stream_error(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: MonkeyPatch,
+):
+    async def raise_error(*args, **kwargs):
+        raise Exception("Test scrape error")
+
+    monkeypatch.setattr("mealie.routes.recipe.recipe_crud_routes.create_from_html", raise_error)
+
+    response = api_client.post(
+        api_routes.recipes_create_url_stream,
+        json={"url": "https://example.com/recipe"},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+    event_types = [e["event"] for e in events]
+
+    assert "error" in event_types
+
+
+def test_create_by_html_or_json_stream_done(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: MonkeyPatch,
+):
+    monkeypatch.setattr(RecipeDataService, "scrape_image", lambda *_: "TEST_IMAGE")
+
+    recipe_data = recipe_test_data[0]
+    api_client.delete(api_routes.recipes_slug(recipe_data.expected_slug), headers=unique_user.token)
+
+    response = api_client.post(
+        api_routes.recipes_create_html_or_json_stream,
+        json={"data": recipe_data.html_file.read_text(), "include_tags": False},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+    event_types = [e["event"] for e in events]
+
+    assert "done" in event_types
+    done_event = next(e for e in events if e["event"] == "done")
+    assert done_event["data"]["slug"] == recipe_data.expected_slug
+
+    assert any(e["event"] == "progress" for e in events)
+
+
+def test_create_by_html_or_json_stream_error(
+    api_client: TestClient,
+    unique_user: TestUser,
+    monkeypatch: MonkeyPatch,
+):
+    async def raise_error(*args, **kwargs):
+        raise Exception("Test scrape error")
+
+    monkeypatch.setattr("mealie.routes.recipe.recipe_crud_routes.create_from_html", raise_error)
+
+    response = api_client.post(
+        api_routes.recipes_create_html_or_json_stream,
+        json={"data": "<html><body>test</body></html>"},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+    event_types = [e["event"] for e in events]
+
+    assert "error" in event_types
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        # valid JSON, but not tagged as a schema.org Recipe
+        json.dumps({"name": "Test", "recipeIngredient": ["1 cup flour"], "recipeInstructions": [{"text": "Mix"}]}),
+        # not valid JSON at all
+        '{"name": "Test",,,}',
+        # no recipe data whatsoever
+        "<html><body>not a recipe</body></html>",
+    ],
+    ids=["missing-schema-declaration", "malformed-json", "no-recipe-data"],
+)
+def test_create_by_html_or_json_stream_invalid_data(api_client: TestClient, unique_user: TestUser, data: str):
+    """Unparseable data must report an error to the client, rather than silently ending the stream"""
+
+    response = api_client.post(
+        api_routes.recipes_create_html_or_json_stream,
+        json={"data": data},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 200
+    events = parse_sse_events(response.text)
+
+    error_events = [e for e in events if e["event"] == "error"]
+    assert error_events
+    assert error_events[0]["data"]["message"] == ParserErrors.BAD_RECIPE_DATA.value
+
+
+def test_create_by_html_or_json_invalid_data(api_client: TestClient, unique_user: TestUser):
+    response = api_client.post(
+        api_routes.recipes_create_html_or_json,
+        json={"data": json.dumps({"name": "Test"})},
+        headers=unique_user.token,
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"]["message"] == ParserErrors.BAD_RECIPE_DATA.value
 
 
 def test_create_recipe_from_zip(api_client: TestClient, unique_user: TestUser, tempdir: str):
@@ -445,6 +621,140 @@ def test_create_recipe_from_zip_invalid_tag(api_client: TestClient, unique_user:
     assert fetched_recipe.tags[0].slug == invalid_name
 
 
+def test_create_recipe_from_zip_existing_food_and_unit_wrong_ids(
+    api_client: TestClient, unique_user: TestUser, tempdir: str
+):
+    database = unique_user.repos
+    food = database.ingredient_foods.create(SaveIngredientFood(name=random_string(), group_id=unique_user.group_id))
+    unit = database.ingredient_units.create(SaveIngredientUnit(name=random_string(), group_id=unique_user.group_id))
+    invalid_food = IngredientFood(id=uuid4(), name=food.name)
+    invalid_unit = IngredientUnit(id=uuid4(), name=unit.name)
+
+    recipe_name = random_string()
+    recipe = Recipe(
+        id=uuid4(),
+        user_id=unique_user.user_id,
+        group_id=unique_user.group_id,
+        name=recipe_name,
+        slug=recipe_name,
+        recipe_ingredient=[RecipeIngredient(note="", food=invalid_food, unit=invalid_unit, quantity=1)],
+    )
+
+    r = api_client.post(api_routes.recipes_create_zip, files=zip_recipe(tempdir, recipe), headers=unique_user.token)
+    assert r.status_code == 201
+
+    fetched_recipe = database.recipes.get_by_slug(unique_user.group_id, recipe.slug)
+    assert fetched_recipe
+    assert fetched_recipe.recipe_ingredient
+    assert len(fetched_recipe.recipe_ingredient) == 1
+    assert fetched_recipe.recipe_ingredient[0].food
+    assert fetched_recipe.recipe_ingredient[0].unit
+    assert str(fetched_recipe.recipe_ingredient[0].food.id) == str(food.id)
+    assert str(fetched_recipe.recipe_ingredient[0].unit.id) == str(unit.id)
+
+
+def test_create_recipe_from_zip_existing_food_alias(api_client: TestClient, unique_user: TestUser, tempdir: str):
+    database = unique_user.repos
+    alias_name = random_string()
+    food = database.ingredient_foods.create(
+        SaveIngredientFood(
+            name=random_string(),
+            group_id=unique_user.group_id,
+            aliases=[CreateIngredientFoodAlias(name=alias_name)],
+        )
+    )
+    invalid_food = IngredientFood(id=uuid4(), name=alias_name)
+
+    recipe_name = random_string()
+    recipe = Recipe(
+        id=uuid4(),
+        user_id=unique_user.user_id,
+        group_id=unique_user.group_id,
+        name=recipe_name,
+        slug=recipe_name,
+        recipe_ingredient=[RecipeIngredient(note="", food=invalid_food, quantity=1)],
+    )
+
+    r = api_client.post(api_routes.recipes_create_zip, files=zip_recipe(tempdir, recipe), headers=unique_user.token)
+    assert r.status_code == 201
+
+    fetched_recipe = database.recipes.get_by_slug(unique_user.group_id, recipe.slug)
+    assert fetched_recipe
+    assert fetched_recipe.recipe_ingredient
+    assert fetched_recipe.recipe_ingredient[0].food
+    assert str(fetched_recipe.recipe_ingredient[0].food.id) == str(food.id)
+
+
+def test_create_recipe_from_zip_existing_unit_abbreviation(api_client: TestClient, unique_user: TestUser, tempdir: str):
+    database = unique_user.repos
+    abbreviation = random_string(5)
+    unit = database.ingredient_units.create(
+        SaveIngredientUnit(
+            name=random_string(),
+            abbreviation=abbreviation,
+            group_id=unique_user.group_id,
+        )
+    )
+    invalid_unit = IngredientUnit(id=uuid4(), name=abbreviation)
+
+    recipe_name = random_string()
+    recipe = Recipe(
+        id=uuid4(),
+        user_id=unique_user.user_id,
+        group_id=unique_user.group_id,
+        name=recipe_name,
+        slug=recipe_name,
+        recipe_ingredient=[RecipeIngredient(note="", unit=invalid_unit, quantity=1)],
+    )
+
+    r = api_client.post(api_routes.recipes_create_zip, files=zip_recipe(tempdir, recipe), headers=unique_user.token)
+    assert r.status_code == 201
+
+    fetched_recipe = database.recipes.get_by_slug(unique_user.group_id, recipe.slug)
+    assert fetched_recipe
+    assert fetched_recipe.recipe_ingredient
+    assert fetched_recipe.recipe_ingredient[0].unit
+    assert str(fetched_recipe.recipe_ingredient[0].unit.id) == str(unit.id)
+
+
+def test_create_recipe_from_zip_invalid_food_and_unit(api_client: TestClient, unique_user: TestUser, tempdir: str):
+    database = unique_user.repos
+    food_name = random_string()
+    unit_name = random_string()
+    invalid_food = IngredientFood(id=uuid4(), name=food_name)
+    invalid_unit = IngredientUnit(id=uuid4(), name=unit_name)
+
+    recipe_name = random_string()
+    recipe = Recipe(
+        id=uuid4(),
+        user_id=unique_user.user_id,
+        group_id=unique_user.group_id,
+        name=recipe_name,
+        slug=recipe_name,
+        recipe_ingredient=[
+            RecipeIngredient(note="", food=invalid_food, unit=invalid_unit, quantity=1),
+            RecipeIngredient(note="", food=IngredientFood(id=uuid4(), name=food_name), quantity=2),
+        ],
+    )
+
+    r = api_client.post(api_routes.recipes_create_zip, files=zip_recipe(tempdir, recipe), headers=unique_user.token)
+    assert r.status_code == 201
+
+    fetched_recipe = database.recipes.get_by_slug(unique_user.group_id, recipe.slug)
+    assert fetched_recipe
+    assert fetched_recipe.recipe_ingredient
+    assert len(fetched_recipe.recipe_ingredient) == 2
+    assert fetched_recipe.recipe_ingredient[0].food
+    assert fetched_recipe.recipe_ingredient[0].unit
+    assert fetched_recipe.recipe_ingredient[0].food.name == food_name
+    assert fetched_recipe.recipe_ingredient[0].unit.name == unit_name
+    assert str(fetched_recipe.recipe_ingredient[0].food.id) != str(invalid_food.id)
+    assert str(fetched_recipe.recipe_ingredient[0].unit.id) != str(invalid_unit.id)
+    # the same new food should be reused for the second ingredient
+    assert fetched_recipe.recipe_ingredient[1].food
+    assert str(fetched_recipe.recipe_ingredient[1].food.id) == str(fetched_recipe.recipe_ingredient[0].food.id)
+
+
 def test_read_update(
     api_client: TestClient,
     unique_user: TestUser,
@@ -475,7 +785,7 @@ def test_read_update(
     assert response.status_code == 200
     recipe = json.loads(response.text)
 
-    assert recipe["notes"] == test_notes
+    assert [{"title": n["title"], "text": n["text"]} for n in recipe["notes"]] == test_notes
 
     assert len(recipe["recipeCategory"]) == len(recipe_categories)
 
@@ -993,6 +1303,66 @@ def test_sub_recipe_not_found_in_other_group(api_client: TestClient, unique_user
     assert response.json()["detail"]["message"] == "No Entry Found"
 
 
+def test_update_with_non_existent_ingredient_references(api_client: TestClient, unique_user: TestUser):
+    """Test that the non-existent ingredient references are removed"""
+
+    database = unique_user.repos
+
+    # Create a food
+    food = database.ingredient_foods.create(
+        SaveIngredientFood(
+            name=random_string(10),
+            group_id=unique_user.group_id,
+        )
+    )
+
+    # Create a recipe_a
+    recipe_a: Recipe = database.recipes.create(
+        Recipe(
+            name=random_string(10),
+            user_id=unique_user.user_id,
+            group_id=unique_user.group_id,
+            recipe_ingredient=[
+                RecipeIngredient(note="", food=food),
+            ],
+        )
+    )
+
+    recipe_url = api_routes.recipes_slug(recipe_a.slug)
+    response = api_client.get(recipe_url, headers=unique_user.token)
+    assert response.status_code == 200
+    recipe_data = json.loads(response.text)
+
+    """
+        Updating the recipe with some references of non-exisitent ingredient(s),
+        mimicking the behaviour observed from the screen
+    """
+    food_ingredient_ref_id = recipe_data["recipeIngredient"][0]["referenceId"]
+    recipe_data["recipeInstructions"].append(
+        {
+            "title": "Step One",
+            "text": "Mash the Peas to form a paste.",
+            "ingredientReferences": [
+                {"referenceId": food_ingredient_ref_id},
+                {"referenceId": "5fb334fe-00b7-43d6-bb75-355977852543"},
+            ],
+        }
+    )
+
+    # Call the put API end point
+    response = api_client.put(recipe_url, json=recipe_data, headers=unique_user.token)
+    assert response.status_code == 200
+    recipe_data = json.loads(response.text)
+
+    """
+        Assert the result to verify that the resulting recipe instruction has reference
+        to only valid id i.e. food_ingredient_ref_id
+    """
+    step_one_ingr_refs = recipe_data["recipeInstructions"][0]["ingredientReferences"]
+    assert len(step_one_ingr_refs) == 1
+    assert step_one_ingr_refs[0]["referenceId"] == food_ingredient_ref_id
+
+
 def test_duplicate(api_client: TestClient, unique_user: TestUser):
     recipe_data = recipe_test_data[0]
 
@@ -1052,8 +1422,11 @@ def test_duplicate(api_client: TestClient, unique_user: TestUser):
     assert response.status_code == 200
     original_recipe = json.loads(response.text)
 
-    assert edited_recipe["notes"] == dup_notes
-    assert original_recipe.get("notes") != edited_recipe.get("notes")
+    def note_text(notes):
+        return [{"title": n["title"], "text": n["text"]} for n in notes or []]
+
+    assert note_text(edited_recipe["notes"]) == note_text(dup_notes)
+    assert note_text(original_recipe.get("notes")) != note_text(edited_recipe.get("notes"))
     assert original_recipe.get("recipeCategory") == previous_categories
 
     # Make sure ingredient edits don't affect the original
@@ -1137,7 +1510,7 @@ def test_remove_notes(api_client: TestClient, unique_user: TestUser):
     assert response.status_code == 200
 
     recipe = json.loads(response.text)
-    recipe["notes"] = [RecipeNote(title=random_string(), text=random_string()).model_dump()]
+    recipe["notes"] = [RecipeNote(title=random_string(), text=random_string()).model_dump(mode="json")]
     response = api_client.put(recipe_url, json=recipe, headers=unique_user.token)
     assert response.status_code == 200
 
@@ -1165,6 +1538,42 @@ def test_delete(api_client: TestClient, unique_user: TestUser):
     assert response.status_code == 200
 
 
+def test_update_missing_name_returns_error_not_500(api_client: TestClient, unique_user: TestUser):
+    """A PUT body without a name used to blank the name out and fail with a 500."""
+    name = random_string()
+    api_client.post(api_routes.recipes, json={"name": name}, headers=unique_user.token)
+
+    response = api_client.put(
+        api_routes.recipes_slug(name),
+        json={"recipeIngredient": [{"quantity": 2.0, "note": random_string()}]},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 422
+
+    # the recipe is left untouched
+    get_response = api_client.get(api_routes.recipes_slug(name), headers=unique_user.token)
+    assert get_response.status_code == 200
+    assert get_response.json()["name"] == name
+
+
+def test_patch_without_name_still_updates(api_client: TestClient, unique_user: TestUser):
+    """PATCH is the partial-update verb, so a body without a name must keep working."""
+    name = random_string()
+    api_client.post(api_routes.recipes, json={"name": name}, headers=unique_user.token)
+
+    note = random_string()
+    response = api_client.patch(
+        api_routes.recipes_slug(name),
+        json={"recipeIngredient": [{"quantity": 2.0, "note": note}]},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+
+    recipe = api_client.get(api_routes.recipes_slug(name), headers=unique_user.token).json()
+    assert recipe["name"] == name
+    assert recipe["recipeIngredient"][0]["note"] == note
+
+
 def test_recipe_crud_404(api_client: TestClient, unique_user: TestUser):
     response = api_client.put(api_routes.recipes_slug("test"), json={"test": "stest"}, headers=unique_user.token)
     assert response.status_code == 404
@@ -1177,6 +1586,83 @@ def test_recipe_crud_404(api_client: TestClient, unique_user: TestUser):
 
     response = api_client.patch(api_routes.recipes_slug("test"), json={"test": "stest"}, headers=unique_user.token)
     assert response.status_code == 404
+
+
+def test_patch_recipe_after_name_changes_without_slug_update(api_client: TestClient, unique_user: TestUser):
+    original_name = "Nourish Bowls (Zuppa Copycat)"
+    translated_name = "Bols nourrissants (copie de Zuppa)"
+
+    response = api_client.post(api_routes.recipes, json={"name": original_name}, headers=unique_user.token)
+    assert response.status_code == 201
+    original_slug = response.json()
+
+    session = unique_user.repos.session
+    recipe = session.query(RecipeModel).filter(RecipeModel.slug == original_slug).one()
+    recipe.name = translated_name
+    session.commit()
+
+    response = api_client.get(api_routes.recipes_slug(original_slug), headers=unique_user.token)
+    assert response.status_code == 200
+
+    recipe_payload = response.json()
+    assert recipe_payload["name"] == translated_name
+    assert recipe_payload["slug"] == original_slug
+
+    response = api_client.patch(
+        api_routes.recipes_slug(original_slug),
+        json={"description": "Translated without changing the stored slug"},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+
+    patched_recipe = response.json()
+    assert patched_recipe["slug"] == original_slug
+    assert patched_recipe["description"] == "Translated without changing the stored slug"
+
+
+def test_patch_recipe_instructions_without_ingredient_references(api_client: TestClient, unique_user: TestUser):
+    response = api_client.post(
+        api_routes.recipes,
+        json={"name": "Patch instructions without refs"},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 201
+    slug = response.json()
+
+    response = api_client.patch(
+        api_routes.recipes_slug(slug),
+        json={"recipeInstructions": [{"text": "Step one."}, {"text": "Step two."}]},
+        headers=unique_user.token,
+    )
+    assert response.status_code == 200
+
+    response = api_client.get(api_routes.recipes_slug(slug), headers=unique_user.token)
+    assert response.status_code == 200
+    recipe = response.json()
+    assert [step["text"] for step in recipe["recipeInstructions"]] == ["Step one.", "Step two."]
+    assert all(step["ingredientReferences"] == [] for step in recipe["recipeInstructions"])
+
+
+def test_put_recipe_name_change_updates_slug(api_client: TestClient, unique_user: TestUser):
+    original_name = "Original Recipe Name"
+    renamed_name = "Renamed Recipe Name"
+
+    response = api_client.post(api_routes.recipes, json={"name": original_name}, headers=unique_user.token)
+    assert response.status_code == 201
+    original_slug = response.json()
+
+    response = api_client.get(api_routes.recipes_slug(original_slug), headers=unique_user.token)
+    assert response.status_code == 200
+
+    recipe_payload = response.json()
+    recipe_payload["name"] = renamed_name
+
+    response = api_client.put(api_routes.recipes_slug(original_slug), json=recipe_payload, headers=unique_user.token)
+    assert response.status_code == 200
+
+    renamed_recipe = response.json()
+    assert renamed_recipe["slug"] == slugify(renamed_name)
+    assert renamed_recipe["name"] == renamed_name
 
 
 def test_create_recipe_same_name(api_client: TestClient, unique_user: TestUser):
@@ -1250,6 +1736,25 @@ def test_get_recipe_by_slug_or_id(api_client: TestClient, unique_user: utils.Tes
         recipe_data = response.json()
         assert recipe_data["slug"] == slug
         assert recipe_data["id"] == recipe_id
+
+
+def test_get_recipe_ingredient_missing_reference_id(api_client: TestClient, unique_user: utils.TestUser):
+    slug = random_string()
+    response = api_client.post(api_routes.recipes, json={"name": slug}, headers=unique_user.token)
+    assert response.status_code == 201
+
+    # Manually edit the database to remove the reference id from the ingredient
+    session = unique_user.repos.session
+    recipe = session.query(RecipeModel).filter(RecipeModel.slug == slug).first()
+    recipe.recipe_ingredient[0].reference_id = None
+    session.commit()
+
+    # Make sure we can fetch the recipe and generate a new reference id
+    response = api_client.get(api_routes.recipes_slug(slug), headers=unique_user.token)
+    assert response.status_code == 200
+    recipe_data = response.json()
+    assert len(recipe_data["recipeIngredient"]) == 1
+    assert recipe_data["recipeIngredient"][0].get("referenceId")
 
 
 @pytest.mark.parametrize("organizer_type", ["tags", "categories", "tools"])
@@ -1369,6 +1874,55 @@ def test_get_cookbook_recipes(api_client: TestClient, unique_user: utils.TestUse
             group_id=unique_user.group_id,
             household_id=unique_user.household_id,
             query_filter_string=f'tags.id IN ["{tag.id}"]',
+        )
+    )
+
+    response = api_client.get(api_routes.recipes, params={"cookbook": cookbook.slug}, headers=unique_user.token)
+    assert response.status_code == 200
+    recipes = [Recipe.model_validate(data) for data in response.json()["items"]]
+
+    fetched_recipe_ids = {recipe.id for recipe in recipes}
+    for recipe in cookbook_recipes:
+        assert recipe.id in fetched_recipe_ids
+    for recipe in other_recipes:
+        assert recipe.id not in fetched_recipe_ids
+
+
+def test_get_cookbook_recipes_by_food_label(api_client: TestClient, unique_user: utils.TestUser):
+    label = unique_user.repos.group_multi_purpose_labels.create(
+        MultiPurposeLabelSave(name=random_string(), group_id=unique_user.group_id)
+    )
+    food = unique_user.repos.ingredient_foods.create(
+        SaveIngredientFood(name=random_string(), group_id=unique_user.group_id, label_id=label.id)
+    )
+    cookbook_recipes = unique_user.repos.recipes.create_many(
+        [
+            Recipe(
+                user_id=unique_user.user_id,
+                group_id=unique_user.group_id,
+                name=random_string(),
+                recipe_ingredient=[RecipeIngredient(food=food)],
+            )
+            for _ in range(3)
+        ]
+    )
+    other_recipes = unique_user.repos.recipes.create_many(
+        [
+            Recipe(
+                user_id=unique_user.user_id,
+                group_id=unique_user.group_id,
+                name=random_string(),
+            )
+            for _ in range(3)
+        ]
+    )
+
+    cookbook = unique_user.repos.cookbooks.create(
+        SaveCookBook(
+            name=random_string(),
+            group_id=unique_user.group_id,
+            household_id=unique_user.household_id,
+            query_filter_string=f'recipe_ingredient.food.label_id IN ["{label.id}"]',
         )
     )
 

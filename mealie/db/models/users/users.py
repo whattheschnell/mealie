@@ -1,5 +1,5 @@
 import enum
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
 from pydantic import ConfigDict
@@ -13,7 +13,7 @@ from mealie.db.models._model_utils.auto_init import auto_init
 from mealie.db.models._model_utils.datetime import NaiveDateTime
 from mealie.db.models._model_utils.guid import GUID
 
-from .._model_base import BaseMixins, SqlAlchemyBase
+from .._model_base import BaseMixins, FilterableColumn, SqlAlchemyBase
 from .user_to_recipe import UserToRecipe
 
 if TYPE_CHECKING:
@@ -50,25 +50,38 @@ class AuthMethod(enum.Enum):
 
 class User(SqlAlchemyBase, BaseMixins):
     __tablename__ = "users"
-    id: Mapped[GUID] = mapped_column(GUID, primary_key=True, default=GUID.generate)
-    full_name: Mapped[str | None] = mapped_column(String, index=True)
-    username: Mapped[str | None] = mapped_column(String, index=True, unique=True)
+
+    id: FilterableColumn[GUID] = mapped_column(GUID, primary_key=True, default=GUID.generate)
+    full_name: FilterableColumn[str | None] = mapped_column(String, index=True)
+    username: FilterableColumn[str | None] = mapped_column(String, index=True, unique=True)
     email: Mapped[str | None] = mapped_column(String, unique=True, index=True)
     password: Mapped[str | None] = mapped_column(String)
     auth_method: Mapped[Enum[AuthMethod]] = mapped_column(Enum(AuthMethod), default=AuthMethod.MEALIE)
     admin: Mapped[bool | None] = mapped_column(Boolean, default=False)
     advanced: Mapped[bool | None] = mapped_column(Boolean, default=False)
 
-    group_id: Mapped[GUID] = mapped_column(GUID, ForeignKey("groups.id"), nullable=False, index=True)
+    group_id: FilterableColumn[GUID] = mapped_column(GUID, ForeignKey("groups.id"), nullable=False, index=True)
     group: Mapped["Group"] = orm.relationship("Group", back_populates="users")
-    household_id: Mapped[GUID | None] = mapped_column(GUID, ForeignKey("households.id"), nullable=True, index=True)
+    household_id: FilterableColumn[GUID | None] = mapped_column(
+        GUID, ForeignKey("households.id"), nullable=True, index=True
+    )
     household: Mapped["Household"] = orm.relationship("Household", back_populates="users")
 
     cache_key: Mapped[str | None] = mapped_column(String, default="1234")
+    # Digest of the OIDC picture claim the stored avatar was built from, so repeat logins
+    # don't re-download an image that hasn't changed.
+    external_avatar_hash: Mapped[str | None] = mapped_column(String, default=None)
     login_attemps: Mapped[int | None] = mapped_column(Integer, default=0)
     locked_at: Mapped[datetime | None] = mapped_column(NaiveDateTime, default=None)
+    tokens_valid_after: Mapped[datetime | None] = mapped_column(NaiveDateTime, default=None)
+    """Tokens issued before this are rejected. Set when the password changes, so that changing it
+    actually evicts whoever was already signed in."""
 
-    # Group Permissions
+    # Announcements
+    show_announcements: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_read_announcement: Mapped[str | None] = mapped_column(String)
+
+    # Permissions
     can_manage_household: Mapped[bool | None] = mapped_column(Boolean, default=False)
     can_manage: Mapped[bool | None] = mapped_column(Boolean, default=False)
     can_invite: Mapped[bool | None] = mapped_column(Boolean, default=False)
@@ -89,10 +102,10 @@ class User(SqlAlchemyBase, BaseMixins):
     owned_recipes: Mapped[Optional["RecipeModel"]] = orm.relationship(
         "RecipeModel", single_parent=True, foreign_keys=[owned_recipes_id]
     )
-    mealplans: Mapped[Optional["GroupMealPlan"]] = orm.relationship(
+    mealplans: Mapped[list["GroupMealPlan"]] = orm.relationship(
         "GroupMealPlan", order_by="GroupMealPlan.date", **sp_args
     )
-    shopping_lists: Mapped[Optional["ShoppingList"]] = orm.relationship("ShoppingList", **sp_args)
+    shopping_lists: Mapped[list["ShoppingList"]] = orm.relationship("ShoppingList", **sp_args)
     rated_recipes: Mapped[list["RecipeModel"]] = orm.relationship(
         "RecipeModel",
         secondary=UserToRecipe.__tablename__,
@@ -103,7 +116,7 @@ class User(SqlAlchemyBase, BaseMixins):
         "RecipeModel",
         secondary=UserToRecipe.__tablename__,
         primaryjoin="and_(User.id==UserToRecipe.user_id, UserToRecipe.is_favorite==True)",
-        back_populates="favorited_by",
+        viewonly=True,
         overlaps="recipe,rated_by,rated_recipes",
     )
     model_config = ConfigDict(
@@ -196,6 +209,14 @@ class User(SqlAlchemyBase, BaseMixins):
 
     def update_password(self, password):
         self.password = password
+        # Changing a password is how people evict someone who got into their account, so every token
+        # issued before now stops working. Stamped here rather than at the call sites so the password
+        # reset flow can't forget it.
+        #
+        # Floored to the second because JWT `iat` is whole seconds: against a sub-second watermark, a
+        # token minted in the same second as the change would have a lower `iat` and be rejected,
+        # locking the user out until the clock ticked over.
+        self.tokens_valid_after = datetime.now(UTC).replace(microsecond=0)
 
     def _set_permissions(
         self, admin, can_manage_household=False, can_manage=False, can_invite=False, can_organize=False, **_

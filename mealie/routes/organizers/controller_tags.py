@@ -8,7 +8,7 @@ from mealie.routes._base.mixins import HttpRepo
 from mealie.schema import mapper
 from mealie.schema.recipe import RecipeTagResponse, TagIn
 from mealie.schema.recipe.recipe import RecipeTag, RecipeTagPagination
-from mealie.schema.recipe.recipe_category import TagSave
+from mealie.schema.recipe.recipe_category import TagMerge, TagOut, TagSave
 from mealie.schema.response.pagination import PaginationQuery
 from mealie.services import urls
 from mealie.services.event_bus_service.event_types import EventOperation, EventTagData, EventTypes
@@ -43,6 +43,21 @@ class TagController(BaseCrudController):
         """Returns a list of tags that do not contain any recipes"""
         return self.repo.get_empty()
 
+    @router.post("/merge", response_model=TagOut)
+    def merge_tags(self, body: TagMerge):
+        """Merges the from_id tag into the to_id tag, then deletes from_id."""
+        self.checks.can_organize()
+
+        if body.from_id == body.to_id:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "from_id and to_id must be different")
+
+        if not self.repo.get_one(body.from_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "from_id tag not found")
+        if not self.repo.get_one(body.to_id):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "to_id tag not found")
+
+        return self.repo.merge(body.from_id, body.to_id)
+
     @router.get("/{item_id}", response_model=RecipeTagResponse)
     def get_one(self, item_id: UUID4):
         """Returns a list of recipes associated with the provided tag."""
@@ -51,8 +66,9 @@ class TagController(BaseCrudController):
     @router.post("", status_code=201)
     def create_one(self, tag: TagIn):
         """Creates a Tag in the database"""
+        self.checks.can_organize()
         save_data = mapper.cast(tag, TagSave, group_id=self.group_id)
-        new_tag = self.repo.create(save_data)
+        new_tag = self.mixins.create_one(save_data)
 
         if new_tag:
             self.publish_event(
@@ -72,6 +88,7 @@ class TagController(BaseCrudController):
     @router.put("/{item_id}", response_model=RecipeTagResponse)
     def update_one(self, item_id: UUID4, new_tag: TagIn):
         """Updates an existing Tag in the database"""
+        self.checks.can_organize()
         save_data = mapper.cast(new_tag, TagSave, group_id=self.group_id)
         tag = self.repo.update(item_id, save_data)
 
@@ -97,6 +114,7 @@ class TagController(BaseCrudController):
         tag does not impact a recipe. The tag will be removed
         from any recipes that contain it
         """
+        self.checks.can_organize()
 
         try:
             tag = self.repo.delete(item_id)
